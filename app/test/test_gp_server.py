@@ -956,6 +956,34 @@ class TestGpServerTraditionalLogin:
         assert "\\lt\\" in response
         assert "\\final\\" in response
 
+    def test_traditional_login_by_uniquenick(self):
+        """The login that follows newuser carries uniquenick instead of user and signs the bare nickname."""
+        client_response = self._compute_client_response(
+            self.test_md5, self.test_nickname, self.client_challenge, "ABCDEFGHIJ"
+        )
+        request_data = {
+            "uniquenick": self.test_nickname,
+            "challenge": self.client_challenge,
+            "response": client_response,
+            "id": "1",
+        }
+        mock_user = self._make_mock_user()
+        mock_persona = self._make_mock_persona()
+        mock_persona.user_id = mock_user.id
+        mock_preauth = MagicMock()
+        mock_preauth.id = 999
+
+        with (
+            patch("app.servers.gp_server.get_user_by_id", return_value=mock_user),
+            patch("app.servers.gp_server.get_persona_by_name", return_value=mock_persona),
+            patch("app.servers.gp_server.create_preauth_ticket", return_value=mock_preauth),
+            patch("app.servers.gp_server.create_gamespy_session", return_value=self._make_mock_session()),
+        ):
+            response = self.gp_server.handle_login(request_data)
+
+        assert "\\lc\\2" in response
+        assert f"\\profileid\\{mock_persona.id}" in response
+
     def test_traditional_login_invalid_password(self):
         """Test traditional login with wrong password."""
         # Use a wrong MD5 to compute the response

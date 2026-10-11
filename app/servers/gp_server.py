@@ -254,8 +254,7 @@ class GpServer(asyncio.Protocol):
 
         # Dispatch: traditional GameSpy login (Generals/ZH) vs FESL pre-auth flow (RA3)
         if not authtoken:
-            user_string = request_data.get("user", "")
-            if user_string:
+            if request_data.get("user") or request_data.get("uniquenick"):
                 return self.handle_login_traditional(request_data)
             return self.format_error("Missing authtoken", request_id)
 
@@ -414,14 +413,21 @@ class GpServer(asyncio.Protocol):
         client_response = request_data.get("response", "")
         request_id = request_data.get("id", "1")
 
-        # Parse user field: "nickname@email"
-        if "@" not in user_string:
-            return self.format_error("Invalid user format", request_id)
+        if not user_string and request_data.get("uniquenick"):
+            # The SDK logs in by unique nickname right after newuser (gpConnectNewUser sets it) and signs that name
+            user_string = request_data["uniquenick"]
+            nickname = user_string
+            known = get_persona_by_name(self.db_session, nickname)
+            user = get_user_by_id(self.db_session, known.user_id) if known else None
+        else:
+            # Parse user field: "nickname@email"
+            if "@" not in user_string:
+                return self.format_error("Invalid user format", request_id)
 
-        nickname, email = user_string.split("@", 1)
+            nickname, email = user_string.split("@", 1)
 
-        # Look up user by email
-        user = get_user_by_email(self.db_session, email)
+            # Look up user by email
+            user = get_user_by_email(self.db_session, email)
         if not user:
             return self.format_error("User not found", request_id)
 
