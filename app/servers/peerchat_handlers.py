@@ -466,7 +466,9 @@ class IRCFactory:
                     target_client = irc_clients[target_nick]
 
                 # Build message with individual target nick (not the comma list)
-                utm_message = IRCMessage(command=wire_command, params=[target_nick, text], prefix=client.user.get_prefix())
+                utm_message = IRCMessage(
+                    command=wire_command, params=[target_nick, text], prefix=client.user.get_prefix()
+                )
                 try:
                     await target_client.send_message(utm_message)
                 except Exception as e:
@@ -941,9 +943,7 @@ class IRCFactory:
 
         result = "".join("\\" + channel.channel_keys.get(k, "") for k in requested_keys)
         if want_all or want_broadcast:
-            result += "".join(
-                f"\\{k}\\{v}" for k, v in channel.channel_keys.items() if want_all or k.startswith("b_")
-            )
+            result += "".join(f"\\{k}\\{v}" for k, v in channel.channel_keys.items() if want_all or k.startswith("b_"))
 
         await client.send_numeric(IRCNumeric.RPL_GETCHANKEY_RESPONSE, channel_name, cookie, result or "\\")
 

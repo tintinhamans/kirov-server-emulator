@@ -183,7 +183,9 @@ class TestGETCKEYExtensions:
         alice = make_client("alice", 1, (GROUP_CHANNEL,))
         irc_channels[GROUP_CHANNEL].user_stats["alice"] = {"b_flags": "s", "b_wins": "9"}
 
-        await IRCFactory.handle(alice, IRCMessage.parse(f"GETCKEY {GROUP_CHANNEL} alice 007 0 :\\b_flags\\username\\b_wins"))
+        await IRCFactory.handle(
+            alice, IRCMessage.parse(f"GETCKEY {GROUP_CHANNEL} alice 007 0 :\\b_flags\\username\\b_wins")
+        )
 
         assert f":s 702 alice {GROUP_CHANNEL} alice 007 :\\s\\XtestX|1\\9" in written(alice)
 
