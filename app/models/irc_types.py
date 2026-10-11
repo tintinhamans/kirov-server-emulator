@@ -91,6 +91,10 @@ class IRCChannel:
     users: set[str] = field(default_factory=set)  # Set of nicknames
     operators: set[str] = field(default_factory=set)  # Set of operator nicknames
     user_stats: dict[str, dict[str, str]] = field(default_factory=dict)  # GameSpy user stats
+    channel_keys: dict[str, str] = field(default_factory=dict)  # GameSpy channel keys (SETCHANKEY)
+    limit: int = 0  # +l user limit, 0 = unlimited
+    key: str = ""  # +k channel password
+    group: str = ""  # SETGROUP value
 
     def is_private(self) -> bool:
         """Check if this is a private channel (GameSpy game lobby)."""
@@ -161,12 +165,21 @@ class IRCNumeric:
     RPL_TOPIC = "332"  # Channel topic
     RPL_NOTOPIC = "331"  # No topic set
     RPL_CHANNELMODEIS = "324"  # Channel mode
+    RPL_WHOISUSER = "311"  # WHOIS user line
+    RPL_ENDOFWHOIS = "318"  # End of WHOIS
+    RPL_WHOISCHANNELS = "319"  # WHOIS channel list
+    RPL_LISTSTART = "321"  # Start of LIST
+    RPL_LIST = "322"  # LIST entry
+    RPL_LISTEND = "323"  # End of LIST
 
     # GameSpy extensions (700-709)
     RPL_CRYPT_CHALLENGE = "705"  # Server encryption challenge
     RPL_CDKEY_OK = "706"  # CD key authenticated
     RPL_GETCKEY_RESPONSE = "702"  # User stats response
     RPL_GETCKEY_END = "703"  # End of GETCKEY
+    RPL_GETKEY_RESPONSE = "700"  # Global key values
+    RPL_GETKEY_END = "701"  # End of GETKEY
+    RPL_GETCHANKEY_RESPONSE = "704"  # Channel key values
 
     # Error codes (400-599)
     ERR_NOSUCHNICK = "401"  # No such nick/channel
@@ -174,6 +187,7 @@ class IRCNumeric:
     ERR_CANNOTSENDTOCHAN = "404"  # Cannot send to channel
     ERR_TOOMANYCHANNELS = "405"  # Too many channels
     ERR_NOTEXTTOSEND = "412"  # No text to send
+    ERR_USERNOTINCHANNEL = "441"  # Target is not on channel
     ERR_NOTONCHANNEL = "442"  # Not on channel
     ERR_UNKNOWNCOMMAND = "421"  # Unknown command
     ERR_NONICKNAMEGIVEN = "431"  # No nickname given
@@ -182,6 +196,8 @@ class IRCNumeric:
     ERR_NEEDMOREPARAMS = "461"  # Need more params
     ERR_ALREADYREGISTRED = "462"  # Already registered
     ERR_PASSWDMISMATCH = "464"  # Password incorrect
+    ERR_CHANNELISFULL = "471"  # Channel is full (+l)
+    ERR_BADCHANNELKEY = "475"  # Wrong channel password (+k)
     ERR_BADCHANMASK = "476"  # Bad channel mask
     ERR_CHANOPRIVSNEEDED = "482"  # Channel operator required
 
@@ -196,6 +212,12 @@ class GameSpyCommand:
     SETCKEY = "SETCKEY"  # Set channel user stats
     UTM = "UTM"  # Update game-specific data
     USRIP = "USRIP"  # Get user's IP address
+    ATM = "ATM"  # Authenticated text message (same wire format as UTM)
+    SETKEY = "SETKEY"  # Set global user keys
+    GETKEY = "GETKEY"  # Get global user keys
+    SETCHANKEY = "SETCHANKEY"  # Set channel keys
+    GETCHANKEY = "GETCHANKEY"  # Get channel keys
+    SETGROUP = "SETGROUP"  # Tag a channel with a group id
 
 
 # Standard IRC commands

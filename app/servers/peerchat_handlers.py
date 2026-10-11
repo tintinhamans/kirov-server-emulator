@@ -3,6 +3,7 @@ IRC command factory/handler.
 Processes IRC commands following the Factory pattern used in FESL.
 """
 
+import fnmatch
 import time
 from typing import TYPE_CHECKING
 
@@ -85,6 +86,26 @@ class IRCFactory:
                     await IRCFactory.handle_utm(client, message)
                 case GameSpyCommand.USRIP:
                     await IRCFactory.handle_usrip(client, message)
+                case GameSpyCommand.ATM:
+                    await IRCFactory.handle_utm(client, message)
+                case GameSpyCommand.SETKEY:
+                    await IRCFactory.handle_setkey(client, message)
+                case GameSpyCommand.GETKEY:
+                    await IRCFactory.handle_getkey(client, message)
+                case GameSpyCommand.SETCHANKEY:
+                    await IRCFactory.handle_setchankey(client, message)
+                case GameSpyCommand.GETCHANKEY:
+                    await IRCFactory.handle_getchankey(client, message)
+                case GameSpyCommand.SETGROUP:
+                    await IRCFactory.handle_setgroup(client, message)
+
+                # Channel / user queries
+                case IRCCommand.LIST:
+                    await IRCFactory.handle_list(client, message)
+                case IRCCommand.WHOIS:
+                    await IRCFactory.handle_whois(client, message)
+                case IRCCommand.KICK:
+                    await IRCFactory.handle_kick(client, message)
 
                 # User queries
                 case IRCCommand.WHO:
@@ -319,27 +340,8 @@ class IRCFactory:
 
         # Process each target user
         for target_nick in target_nicks:
-            response_values = []
-
-            # Handle special 'username' key - return the user's encoded username
-            if "username" in requested_keys:
-                with irc_clients_lock:
-                    if target_nick in irc_clients:
-                        target_client = irc_clients[target_nick]
-                        response_values.append(target_client.user.username or target_nick)
-                    else:
-                        response_values.append(target_nick)
-
-            # Get regular stats for other keys
             stats = channel.user_stats.get(target_nick, {})
-            for key in requested_keys:
-                if key == "username":
-                    continue  # Already handled
-                value = stats.get(key, "")
-                response_values.append(value)
-
-            # Build response: \value1\value2 (backslash-separated, no trailing backslash)
-            response_string = "\\" + "\\".join(response_values)
+            response_string = IRCFactory._build_ckey_values(target_nick, stats, requested_keys)
 
             # Send 702 response: :s 702 <requester> <channel> <target> <requestid> \values\
             await client.send_numeric(
@@ -398,15 +400,18 @@ class IRCFactory:
 
         channel.user_stats[client.user.nickname].update(stats)
 
-        # Broadcast update to all channel members (702 with BCAST)
+        # Broadcast only the broadcast (b_) keys to all channel members (702 with BCAST)
         # Format: :s 702 #channel #channel nickname BCAST \key\value...
-        broadcast_message = IRCMessage(
-            command=IRCNumeric.RPL_GETCKEY_RESPONSE,
-            params=[channel_name, channel_name, client.user.nickname, "BCAST", "\\" + keys_string],
-            prefix="s",
-        )
+        bcast = {k: v for k, v in stats.items() if k.startswith("b_")}
+        if bcast:
+            bcast_string = "".join(f"\\{k}\\{v}" for k, v in bcast.items())
+            broadcast_message = IRCMessage(
+                command=IRCNumeric.RPL_GETCKEY_RESPONSE,
+                params=[channel_name, channel_name, client.user.nickname, "BCAST", bcast_string],
+                prefix="s",
+            )
 
-        await client.broadcast_to_channel(channel_name, broadcast_message, exclude_self=False)
+            await client.broadcast_to_channel(channel_name, broadcast_message, exclude_self=False)
 
         logger.debug(f"IRC client {client.user.nickname} set CKEY in {channel_name}: {stats}")
 
@@ -427,6 +432,8 @@ class IRCFactory:
 
         target = message.params[0]
         text = message.params[1]
+        # ATM is the authenticated twin of UTM and is relayed with the same shape
+        wire_command = "ATM" if message.command.upper() == "ATM" else "UTM"
 
         if target.startswith("#"):
             # Channel message - broadcast to all members
@@ -440,7 +447,7 @@ class IRCFactory:
                 return
 
             # Build UTM message with sender prefix
-            utm_message = IRCMessage(command="UTM", params=[target, text], prefix=client.user.get_prefix())
+            utm_message = IRCMessage(command=wire_command, params=[target, text], prefix=client.user.get_prefix())
             await client.broadcast_to_channel(target, utm_message, exclude_self=True)
         else:
             # Direct message to one or more users (comma-separated)
@@ -459,7 +466,7 @@ class IRCFactory:
                     target_client = irc_clients[target_nick]
 
                 # Build message with individual target nick (not the comma list)
-                utm_message = IRCMessage(command="UTM", params=[target_nick, text], prefix=client.user.get_prefix())
+                utm_message = IRCMessage(command=wire_command, params=[target_nick, text], prefix=client.user.get_prefix())
                 try:
                     await target_client.send_message(utm_message)
                 except Exception as e:
@@ -570,6 +577,17 @@ class IRCFactory:
             if not channel_name.startswith("#"):
                 await client.send_numeric(IRCNumeric.ERR_BADCHANMASK, channel_name, "Bad channel mask")
                 continue
+
+            # Enforce +l (user limit) and +k (password) set by the channel creator
+            existing = irc_channels.get(channel_name)
+            if existing and client.user.nickname not in existing.users:
+                if existing.limit and len(existing.users) >= existing.limit:
+                    await client.send_numeric(IRCNumeric.ERR_CHANNELISFULL, channel_name, "Channel is full")
+                    continue
+                supplied_key = message.params[1] if len(message.params) > 1 else ""
+                if existing.key and supplied_key != existing.key:
+                    await client.send_numeric(IRCNumeric.ERR_BADCHANNELKEY, channel_name, "Bad channel key")
+                    continue
 
             # Join channel
             await join_channel(client, channel_name)
@@ -724,7 +742,13 @@ class IRCFactory:
                 if mode_params:
                     channel.modes += " " + mode_params
 
-                # Broadcast mode change to channel (no response needed for self)
+                IRCFactory._apply_mode_changes(channel, mode_changes, message.params[2:])
+
+                # Tell the other members; the setter does not need an echo
+                mode_message = IRCMessage(
+                    command="MODE", params=[target, mode_changes, *message.params[2:]], prefix=client.user.get_prefix()
+                )
+                await client.broadcast_to_channel(target, mode_message, exclude_self=True)
                 logger.debug(f"Channel {target} mode set to: {channel.modes}")
         else:
             # User mode
@@ -745,6 +769,290 @@ class IRCFactory:
                     for char in mode_change[1:]:
                         client.user.mode = client.user.mode.replace(char, "")
                 logger.debug(f"User {target} mode set to: {client.user.mode}")
+
+    # --- GameSpy key / channel commands (Generals / Zero Hour peer SDK) ---
+
+    @staticmethod
+    def _parse_key_pairs(keys_string: str) -> dict[str, str]:
+        r"""Parse \key\value\key\value into a dict (leading backslash optional)."""
+        if keys_string.startswith("\\"):
+            keys_string = keys_string[1:]
+        parts = keys_string.split("\\")
+        return {parts[i]: (parts[i + 1] if i + 1 < len(parts) else "") for i in range(0, len(parts), 2) if parts[i]}
+
+    @staticmethod
+    def _build_ckey_values(nick: str, stats: dict[str, str], requested_keys: list[str]) -> str:
+        r"""
+        Build the value string of a 702 reply: one \value per requested key, in request order.
+        The special key 'username' yields the encoded username and 'b_*' appends every
+        broadcast key of the user as \key\value pairs after the requested values.
+        """
+        values: list[str] = []
+        want_broadcast = False
+        for key in requested_keys:
+            if key == "b_*":
+                want_broadcast = True
+            elif key == "username":
+                with irc_clients_lock:
+                    target_client = irc_clients.get(nick)
+                values.append((target_client.user.username if target_client else None) or nick)
+            else:
+                values.append(stats.get(key, ""))
+
+        result = "".join("\\" + v for v in values)
+        if want_broadcast:
+            result += "".join(f"\\{k}\\{v}" for k, v in stats.items() if k.startswith("b_"))
+        return result or "\\"
+
+    @staticmethod
+    def _apply_mode_changes(channel, mode_string: str, params: list[str]):
+        """Track the parts of a MODE change that affect JOIN: +l <limit> and +k <password>."""
+        sign = "+"
+        remaining = list(params)
+        for char in mode_string:
+            if char in "+-":
+                sign = char
+            elif char == "l":
+                if sign == "+" and remaining:
+                    try:
+                        channel.limit = max(0, int(remaining.pop(0)))
+                    except ValueError:
+                        channel.limit = 0
+                else:
+                    channel.limit = 0
+            elif char == "k":
+                if remaining:
+                    password = remaining.pop(0)
+                    channel.key = password if sign == "+" else ""
+                elif sign == "-":
+                    channel.key = ""
+
+    @staticmethod
+    async def handle_setkey(client: "IRCClient", message: IRCMessage):
+        r"""
+        Handle SETKEY command (set global user keys).
+        Format: SETKEY :\key\value\key\value...
+        No reply; the keys are read back with GETKEY.
+        """
+        if len(message.params) < 1:
+            await client.send_numeric(IRCNumeric.ERR_NEEDMOREPARAMS, "SETKEY", "Not enough parameters")
+            return
+
+        client.user.stats.update(IRCFactory._parse_key_pairs(message.params[-1]))
+
+    @staticmethod
+    async def handle_getkey(client: "IRCClient", message: IRCMessage):
+        r"""
+        Handle GETKEY command (get global user keys of a user or of everyone in a channel).
+        Format: GETKEY <nick|#channel> <cookie> <flags> :\key1\key2...
+        Response: one 700 <nick> <cookie> :\v1\v2 per user, then 701 <target> <cookie> :End of GETKEY
+        """
+        if len(message.params) < 3:
+            await client.send_numeric(IRCNumeric.ERR_NEEDMOREPARAMS, "GETKEY", "Not enough parameters")
+            return
+
+        target = message.params[0]
+        cookie = message.params[1]
+        keys_string = message.params[3] if len(message.params) > 3 else ""
+        if keys_string.startswith("\\"):
+            keys_string = keys_string[1:]
+        requested_keys = [k for k in keys_string.split("\\") if k]
+
+        if target.startswith("#"):
+            if target not in irc_channels:
+                await client.send_numeric(IRCNumeric.ERR_NOSUCHCHANNEL, target, "No such channel")
+                return
+            nicks = sorted(irc_channels[target].users)
+        else:
+            nicks = [target]
+
+        for nick in nicks:
+            with irc_clients_lock:
+                target_client = irc_clients.get(nick)
+            if target_client is None:
+                if not target.startswith("#"):
+                    await client.send_numeric(IRCNumeric.ERR_NOSUCHNICK, nick, "No such nick/channel")
+                continue
+            values = "".join("\\" + target_client.user.stats.get(k, "") for k in requested_keys) or "\\"
+            await client.send_numeric(IRCNumeric.RPL_GETKEY_RESPONSE, nick, cookie, values)
+
+        await client.send_numeric(IRCNumeric.RPL_GETKEY_END, target, cookie, "End of GETKEY")
+
+    @staticmethod
+    async def handle_setchankey(client: "IRCClient", message: IRCMessage):
+        r"""
+        Handle SETCHANKEY command (set channel keys).
+        Format: SETCHANKEY <channel> :\key\value...
+        Broadcast (b_) keys are pushed to the channel as 704 BCAST.
+        """
+        if len(message.params) < 2:
+            await client.send_numeric(IRCNumeric.ERR_NEEDMOREPARAMS, "SETCHANKEY", "Not enough parameters")
+            return
+
+        channel_name = message.params[0]
+        if channel_name not in irc_channels:
+            await client.send_numeric(IRCNumeric.ERR_NOSUCHCHANNEL, channel_name, "No such channel")
+            return
+
+        channel = irc_channels[channel_name]
+        if client.user.nickname not in channel.users:
+            await client.send_numeric(IRCNumeric.ERR_CANNOTSENDTOCHAN, channel_name, "Cannot send to channel")
+            return
+
+        pairs = IRCFactory._parse_key_pairs(message.params[1])
+        channel.channel_keys.update(pairs)
+
+        bcast = {k: v for k, v in pairs.items() if k.startswith("b_")}
+        if bcast:
+            bcast_string = "".join(f"\\{k}\\{v}" for k, v in bcast.items())
+            broadcast_message = IRCMessage(
+                command=IRCNumeric.RPL_GETCHANKEY_RESPONSE,
+                params=[channel_name, channel_name, "BCAST", bcast_string],
+                prefix="s",
+            )
+            await client.broadcast_to_channel(channel_name, broadcast_message, exclude_self=False)
+
+    @staticmethod
+    async def handle_getchankey(client: "IRCClient", message: IRCMessage):
+        r"""
+        Handle GETCHANKEY command (get channel keys).
+        Format: GETCHANKEY <channel> <cookie> <flags> :\key1\key2...   (or :* for every key)
+        Response: 704 <channel> <cookie> :\v1\v2
+        """
+        if len(message.params) < 3:
+            await client.send_numeric(IRCNumeric.ERR_NEEDMOREPARAMS, "GETCHANKEY", "Not enough parameters")
+            return
+
+        channel_name = message.params[0]
+        cookie = message.params[1]
+        keys_string = message.params[3] if len(message.params) > 3 else ""
+
+        if channel_name not in irc_channels:
+            await client.send_numeric(IRCNumeric.ERR_NOSUCHCHANNEL, channel_name, "No such channel")
+            return
+        channel = irc_channels[channel_name]
+
+        if keys_string.startswith("\\"):
+            keys_string = keys_string[1:]
+        tokens = [k for k in keys_string.split("\\") if k]
+        want_all = "*" in tokens
+        want_broadcast = "b_*" in tokens
+        requested_keys = [k for k in tokens if k not in ("*", "b_*")]
+
+        result = "".join("\\" + channel.channel_keys.get(k, "") for k in requested_keys)
+        if want_all or want_broadcast:
+            result += "".join(
+                f"\\{k}\\{v}" for k, v in channel.channel_keys.items() if want_all or k.startswith("b_")
+            )
+
+        await client.send_numeric(IRCNumeric.RPL_GETCHANKEY_RESPONSE, channel_name, cookie, result or "\\")
+
+    @staticmethod
+    async def handle_setgroup(client: "IRCClient", message: IRCMessage):
+        """Handle SETGROUP command: tag a channel with a group id. Format: SETGROUP <channel> <group>"""
+        if len(message.params) < 2:
+            await client.send_numeric(IRCNumeric.ERR_NEEDMOREPARAMS, "SETGROUP", "Not enough parameters")
+            return
+
+        channel_name = message.params[0]
+        if channel_name not in irc_channels:
+            await client.send_numeric(IRCNumeric.ERR_NOSUCHCHANNEL, channel_name, "No such channel")
+            return
+
+        irc_channels[channel_name].group = message.params[1]
+
+    @staticmethod
+    async def handle_list(client: "IRCClient", message: IRCMessage):
+        """
+        Handle LIST command.
+        Format: LIST [<mask>]   (mask supports * and ? wildcards)
+        Response: 321, one 322 <channel> <numusers> :<topic> per match, 323
+        """
+        mask = message.params[0] if message.params else "*"
+
+        await client.send_numeric(IRCNumeric.RPL_LISTSTART, "Channel", "Users  Name")
+        for name, channel in sorted(irc_channels.items()):
+            if mask not in ("", "*") and not fnmatch.fnmatchcase(name.lower(), mask.lower()):
+                continue
+            await client.send_numeric(IRCNumeric.RPL_LIST, name, str(len(channel.users)), channel.topic or "")
+        await client.send_numeric(IRCNumeric.RPL_LISTEND, "End of /LIST")
+
+    @staticmethod
+    async def handle_whois(client: "IRCClient", message: IRCMessage):
+        """
+        Handle WHOIS command.
+        Response: 311 <nick> <user> <host> * :<realname>, 319 <nick> :<channels>, 318 <nick> :End of /WHOIS list
+        """
+        if len(message.params) < 1:
+            await client.send_numeric(IRCNumeric.ERR_NONICKNAMEGIVEN, "No nickname given")
+            return
+
+        nick = message.params[0]
+        with irc_clients_lock:
+            target_client = irc_clients.get(nick)
+
+        if target_client is None:
+            await client.send_numeric(IRCNumeric.ERR_NOSUCHNICK, nick, "No such nick/channel")
+        else:
+            user = target_client.user
+            await client.send_numeric(
+                IRCNumeric.RPL_WHOISUSER,
+                nick,
+                user.username or "unknown",
+                user.hostname or "unknown",
+                "*",
+                user.realname or nick,
+            )
+            if user.channels:
+                await client.send_numeric(IRCNumeric.RPL_WHOISCHANNELS, nick, " ".join(sorted(user.channels)))
+
+        await client.send_numeric(IRCNumeric.RPL_ENDOFWHOIS, nick, "End of /WHOIS list")
+
+    @staticmethod
+    async def handle_kick(client: "IRCClient", message: IRCMessage):
+        """
+        Handle KICK command (channel operator only).
+        Format: KICK <channel> <nick> [:<reason>]
+        The KICK is broadcast to the whole channel (including the victim) before the victim is removed.
+        """
+        if len(message.params) < 2:
+            await client.send_numeric(IRCNumeric.ERR_NEEDMOREPARAMS, "KICK", "Not enough parameters")
+            return
+
+        channel_name = message.params[0]
+        victim = message.params[1]
+        reason = message.params[2] if len(message.params) > 2 else client.user.nickname
+
+        if channel_name not in irc_channels:
+            await client.send_numeric(IRCNumeric.ERR_NOSUCHCHANNEL, channel_name, "No such channel")
+            return
+
+        channel = irc_channels[channel_name]
+        if client.user.nickname not in channel.users:
+            await client.send_numeric(IRCNumeric.ERR_NOTONCHANNEL, channel_name, "You're not on that channel")
+            return
+        if not channel.is_operator(client.user.nickname):
+            await client.send_numeric(IRCNumeric.ERR_CHANOPRIVSNEEDED, channel_name, "You're not channel operator")
+            return
+        if victim not in channel.users:
+            await client.send_numeric(
+                IRCNumeric.ERR_USERNOTINCHANNEL, victim, channel_name, "They aren't on that channel"
+            )
+            return
+
+        kick_message = IRCMessage(
+            command="KICK", params=[channel_name, victim, reason], prefix=client.user.get_prefix()
+        )
+        await client.broadcast_to_channel(channel_name, kick_message, exclude_self=False)
+
+        with irc_clients_lock:
+            victim_client = irc_clients.get(victim)
+        if victim_client is not None:
+            await part_channel(victim_client, channel_name, reason)
+        else:
+            channel.users.discard(victim)
+            channel.operators.discard(victim)
+            channel.user_stats.pop(victim, None)
 
     # --- Messaging Commands ---
 
