@@ -210,6 +210,7 @@ class HeartbeatMaster(asyncio.DatagramProtocol):
         # Update session timestamp if exists
         if client_id in self.game_sessions:
             self.game_sessions[client_id]["last_keepalive"] = True
+        GameSessionRegistry.get_instance().touch(client_id)
 
     def _send_challenge(self, addr: tuple[str, int], client_id: int):
         """

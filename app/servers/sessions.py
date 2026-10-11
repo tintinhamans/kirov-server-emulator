@@ -555,6 +555,10 @@ class GameSessionRegistry:
 
     _instance: Optional["GameSessionRegistry"] = None
 
+    # Hosts send a heartbeat or keepalive at least every 20 seconds (qr2); a host that crashed never sends the
+    # exit heartbeat, so silent sessions are dropped after this many seconds.
+    SESSION_TTL_SECONDS = 300.0
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -601,6 +605,7 @@ class GameSessionRegistry:
 
         if existing_game:
             # Update existing GameEntry
+            existing_game.last_seen = time.time()
             existing_game.public_ip = public_ip
             existing_game.public_port = public_port
             existing_game.private_ip = private_ip
@@ -641,8 +646,24 @@ class GameSessionRegistry:
             del self._sessions[client_id]
             logger.info("Unregistered game: client_id=%d", client_id)
 
+    def touch(self, client_id: int):
+        """Mark a session as alive (keepalive from the host)."""
+        game = self._sessions.get(client_id)
+        if game is not None:
+            game.last_seen = time.time()
+
+    def expire_stale(self, now: float | None = None) -> int:
+        """Drop sessions whose host has been silent for longer than SESSION_TTL_SECONDS."""
+        now = time.time() if now is None else now
+        stale = [cid for cid, game in self._sessions.items() if now - game.last_seen > self.SESSION_TTL_SECONDS]
+        for cid in stale:
+            del self._sessions[cid]
+            logger.info("Expired silent game session: client_id=%d", cid)
+        return len(stale)
+
     def get_games(self) -> list:
         """Get all registered games as a list of GameEntry objects."""
+        self.expire_stale()
         return list(self._sessions.values())
 
     def get_game(self, client_id: int) -> GameEntry | None:

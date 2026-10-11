@@ -8,6 +8,7 @@ room lists and game lists in the GameSpy master server protocol.
 import re
 import socket
 import struct
+import time
 from dataclasses import dataclass, field
 
 from app.util.logging_helper import get_logger
@@ -84,6 +85,7 @@ class GameEntry:
     traced_ip: str | None = None
     traced_port: int | None = None
     fields: dict = field(default_factory=dict)
+    last_seen: float = field(default_factory=time.time)  # refreshed by heartbeats and keepalives
 
     def __post_init__(self):
         if self.traced_ip is None:
