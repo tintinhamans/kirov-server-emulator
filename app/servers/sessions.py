@@ -8,6 +8,7 @@ This module contains session managers for different server types:
 """
 
 import asyncio
+import ipaddress
 import socket
 import struct
 import time
@@ -43,6 +44,26 @@ CONNECT_DELAY = 0.1  # 100ms to ensure all INIT packets are processed
 # =============================================================================
 # SessionManager - Generic session tracking for GP server
 # =============================================================================
+
+
+_RFC1918 = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def _pick_private_ip(info: dict, default: str) -> str:
+    """Return the local address the host's peer library derives its staging room name from.
+
+    The peer SDK hashes the first RFC 1918 address of the host into the room name, while the heartbeat lists
+    every adapter in order. On a multi-adapter host (VPN, virtual switch) localip0 can be a different address,
+    so a joiner would compute another room name than the host created. Fall back to localip0.
+    """
+    keys = sorted((k for k in info if k.startswith("localip") and k[7:].isdigit()), key=lambda k: int(k[7:]))
+    for key in keys:
+        try:
+            if any(ipaddress.ip_address(info[key]) in net for net in _RFC1918):
+                return info[key]
+        except ValueError:
+            continue
+    return info.get("localip0", default)
 
 
 class SessionManager:
@@ -628,7 +649,7 @@ class GameSessionRegistry:
 
         # Parse ports
         public_port = int(info.get("hostport", port))
-        private_ip = info.get("localip0", host)
+        private_ip = _pick_private_ip(info, host)
         private_port = int(info.get("localport", public_port))
 
         # Check if session already exists
