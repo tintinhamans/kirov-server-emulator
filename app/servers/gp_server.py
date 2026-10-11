@@ -34,6 +34,7 @@ from app.db.crud import (
     create_buddy_request,
     create_game_invite,
     create_gamespy_session,
+    create_new_user,
     create_persona_for_user,
     create_preauth_ticket,
     delete_buddy_one_way,
@@ -43,14 +44,22 @@ from app.db.crud import (
     get_persona_friends,
     get_user_by_email,
     get_user_by_id,
+    get_user_by_username,
     invalidate_gamespy_session,
     update_gamespy_session_status,
     validate_and_consume_preauth_ticket,
 )
 from app.db.database import create_session
+from app.models.models import UserCreate
+from app.security import md5_hash
+from app.util.gp_password import decode_gp_password
 
 if TYPE_CHECKING:
     from app.servers.sessions import SessionManager
+
+
+def _newuser_error_response(message: str, request_id: str) -> str:
+    return f"\\error\\\\err\\516\\fatal\\\\errmsg\\{message}\\id\\{request_id}\\final\\"
 
 
 class GpServer(asyncio.Protocol):
@@ -129,6 +138,8 @@ class GpServer(asyncio.Protocol):
             response = ""
             if command == "login":
                 response = self.handle_login(request_data)
+            elif command == "newuser":
+                response = self.handle_newuser(request_data)
             elif command == "getprofile":
                 response = self.handle_getprofile(request_data)
             elif command == "status":
@@ -335,6 +346,54 @@ class GpServer(asyncio.Protocol):
         result = self.format_response(response_data)
         logger.debug("Formatted response: %s", result)
         return result
+
+    def handle_newuser(self, request_data: dict[str, str]) -> str:
+        r"""
+        Handle \newuser\ command - create a GameSpy account from the in-game "Create Account" dialog
+        (Generals / Zero Hour, SDK gpConnectNewUser). The same connection logs in afterwards.
+
+        Request fields:
+        - email: account email
+        - nick: profile nickname (becomes the account name and the first persona)
+        - passwordenc: password obfuscated by the SDK (see app.util.gp_password)
+        - uniquenick, productid, gamename, namespaceid, partnerid, id
+
+        Response:
+        - success: \nur\\userid\<id>\profileid\<id>\id\<id>\final\
+        - failure: \error\\err\<code>\fatal\\errmsg\<text>\id\<id>\final\
+        """
+        request_id = request_data.get("id", "1")
+        email = request_data.get("email", "")
+        nick = request_data.get("nick", "")
+        password = decode_gp_password(request_data.get("passwordenc", ""))
+
+        if not email or not nick or not password:
+            return self._newuser_error("Invalid account data", request_id)
+
+        user = get_user_by_email(self.db_session, email)
+        if user is not None:
+            # An existing account may add another nickname if the password matches
+            if user.gamespy_password_md5 != md5_hash(password):
+                return self._newuser_error("An account with that email already exists", request_id)
+        else:
+            if get_user_by_username(self.db_session, nick) is not None or get_persona_by_name(self.db_session, nick):
+                return self._newuser_error("That nickname is already in use", request_id)
+            # model_construct: GameSpy nicknames and passwords can be shorter than the REST API minimums
+            user_create = UserCreate.model_construct(username=nick, password=password, email=email)
+            user = create_new_user(self.db_session, user_create)
+
+        persona = get_persona_by_name(self.db_session, nick)
+        if persona is None:
+            persona = create_persona_for_user(self.db_session, user, nick)
+        elif persona.user_id != user.id:
+            return self._newuser_error("That nickname is already in use", request_id)
+
+        logger.debug("Created GameSpy account: user=%s persona=%s", user.id, persona.id)
+        return self.format_response({"nur": "", "userid": str(user.id), "profileid": str(persona.id), "id": request_id})
+
+    def _newuser_error(self, message: str, request_id: str) -> str:
+        """Error reply in the shape the SDK parses (error / err / fatal / errmsg / id)."""
+        return _newuser_error_response(message, request_id)
 
     def handle_login_traditional(self, request_data: dict[str, str]) -> str:
         r"""
