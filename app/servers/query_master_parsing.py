@@ -503,6 +503,45 @@ def _compute_query_key(validate_token: bytes) -> bytes:
     return b"\x00\x00"
 
 
+def build_game_entry(game: "GameEntry", fields: list, popular_list: bool = True) -> bytes:
+    """
+    Build one game entry: result flags, public ip/port, private ip/port, traced ip, then the field values.
+
+    The initial list prefixes each string with 0xFF (an index into the popular value list, 0xFF = inline).
+    Pushed entries do not use the popular value list, so their strings carry no prefix.
+    """
+    entry = struct.pack("B", RESULT_TYPE_FULL)
+    entry += ip_to_bytes(game.public_ip)
+    entry += struct.pack("!H", game.public_port)
+    entry += ip_to_bytes(game.private_ip)
+    entry += struct.pack("!H", game.private_port)
+    entry += ip_to_bytes(game.traced_ip)
+    for field_name in fields:
+        value = game.get_field_value(field_name)
+        if popular_list:
+            entry += encode_field_value_classic(value)
+        else:
+            entry += value.encode("utf-8") + b"\x00"
+    return entry
+
+
+# Messages a master server pushes on an open list connection (SDK sb_internal.h)
+PUSH_SERVER_MESSAGE = 2
+DELETE_SERVER_MESSAGE = 4
+
+
+def build_push_server_message(game: "GameEntry", fields: list) -> bytes:
+    """A server added or updated: u16be length (including itself), type 2, entry without popular value indexes."""
+    body = bytes([PUSH_SERVER_MESSAGE]) + build_game_entry(game, fields, popular_list=False)
+    return struct.pack("!H", len(body) + 2) + body
+
+
+def build_delete_server_message(game: "GameEntry") -> bytes:
+    """A server went away: u16be length, type 4, public ip and port as in the list entry."""
+    body = bytes([DELETE_SERVER_MESSAGE]) + ip_to_bytes(game.public_ip) + struct.pack("!H", game.public_port)
+    return struct.pack("!H", len(body) + 2) + body
+
+
 def build_game_list_response(
     games: list,
     fields: list,
@@ -559,24 +598,7 @@ def build_game_list_response(
 
     # Game entries — no per-entry terminator
     for game in games:
-        # Result type '~' for full entry
-        response += struct.pack("B", RESULT_TYPE_FULL)
-
-        # Public IP/port
-        response += ip_to_bytes(game.public_ip)
-        response += struct.pack("!H", game.public_port)
-
-        # Private IP/port
-        response += ip_to_bytes(game.private_ip)
-        response += struct.pack("!H", game.private_port)
-
-        # Traced IP/port (same as public if not specified)
-        response += ip_to_bytes(game.traced_ip)
-
-        # Field values
-        for field_name in fields:
-            value = game.get_field_value(field_name)
-            response += encode_field_value_classic(value)
+        response += build_game_entry(game, fields)
 
     # End marker
     response += b"\x00"

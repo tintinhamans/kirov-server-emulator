@@ -559,6 +559,9 @@ class GameSessionRegistry:
     # exit heartbeat, so silent sessions are dropped after this many seconds.
     SESSION_TTL_SECONDS = 300.0
 
+    # Callbacks fn(event, game) with event 'update' (new or changed) or 'delete'; used by the master server to push list changes.
+    _listeners: list = []
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -571,6 +574,34 @@ class GameSessionRegistry:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    @classmethod
+    def add_listener(cls, listener):
+        """Register a callback fn(event, game); the same callback is only added once."""
+        if listener not in cls._listeners:
+            cls._listeners.append(listener)
+
+    @classmethod
+    def remove_listener(cls, listener):
+        if listener in cls._listeners:
+            cls._listeners.remove(listener)
+
+    def _notify(self, event: str, game):
+        for listener in list(self._listeners):
+            try:
+                listener(event, game)
+            except Exception:
+                logger.exception("Game session listener failed")
+
+    @staticmethod
+    def _signature(game) -> tuple:
+        return (
+            game.public_ip,
+            game.public_port,
+            game.private_ip,
+            game.private_port,
+            tuple(sorted((k, str(v)) for k, v in game.fields.items() if not k.startswith("_"))),
+        )
 
     def register_game(self, client_id: int, host: str, port: int, info: dict):
         """
@@ -606,6 +637,7 @@ class GameSessionRegistry:
         if existing_game:
             # Update existing GameEntry
             existing_game.last_seen = time.time()
+            previous = self._signature(existing_game)
             existing_game.public_ip = public_ip
             existing_game.public_port = public_port
             existing_game.private_ip = private_ip
@@ -613,6 +645,8 @@ class GameSessionRegistry:
             existing_game.traced_ip = host
             existing_game.traced_port = port
             existing_game.fields = info
+            if self._signature(existing_game) != previous:
+                self._notify("update", existing_game)
             logger.debug(
                 "Updated game: client_id=%d, host=%s:%d, hostname=%s",
                 client_id,
@@ -632,6 +666,7 @@ class GameSessionRegistry:
                 fields=info,
             )
             self._sessions[client_id] = game
+            self._notify("update", game)
             logger.info(
                 "Registered game: client_id=%d, host=%s:%d, hostname=%s",
                 client_id,
@@ -643,8 +678,9 @@ class GameSessionRegistry:
     def unregister_game(self, client_id: int):
         """Remove a game session."""
         if client_id in self._sessions:
-            del self._sessions[client_id]
+            game = self._sessions.pop(client_id)
             logger.info("Unregistered game: client_id=%d", client_id)
+            self._notify("delete", game)
 
     def touch(self, client_id: int):
         """Mark a session as alive (keepalive from the host)."""
@@ -657,8 +693,9 @@ class GameSessionRegistry:
         now = time.time() if now is None else now
         stale = [cid for cid, game in self._sessions.items() if now - game.last_seen > self.SESSION_TTL_SECONDS]
         for cid in stale:
-            del self._sessions[cid]
+            game = self._sessions.pop(cid)
             logger.info("Expired silent game session: client_id=%d", cid)
+            self._notify("delete", game)
         return len(stale)
 
     def get_games(self) -> list:

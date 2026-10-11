@@ -14,7 +14,9 @@ from app.servers.query_master_parsing import (
     DEFAULT_MASTER_PORT,
     GameEntry,
     QueryRequest,
+    build_delete_server_message,
     build_game_list_response,
+    build_push_server_message,
     build_room_list_response,
     create_default_rooms,
     create_rooms_by_game,
@@ -54,6 +56,8 @@ class QueryMasterHandler:
         self.rooms: list = []  # List of RoomEntry (legacy, RA3 default)
         self.rooms_by_game: dict[str, list] = {}  # GameSpy game name -> rooms
         self.games: list = []  # List of GameEntry
+        self.last_request = None  # request of the latest handle_query call
+        self.last_cipher = None  # cipher that encrypted its response; continues for pushed messages
 
     def set_rooms(self, rooms: list):
         """Set the list of available rooms (legacy, used as fallback)."""
@@ -83,6 +87,8 @@ class QueryMasterHandler:
             Response bytes to send back to client (encrypted if encrypt=True)
         """
         request = parse_tcp_query(data)
+        self.last_request = request
+        self.last_cipher = None
 
         if not request.game_name:
             logger.warning("Invalid query: no game name found")
@@ -122,6 +128,7 @@ class QueryMasterHandler:
                 gamekey = next(iter(self.gamekeys.values()), "")
 
             cipher = EncTypeX(key=gamekey, validate=validate_token)
+            self.last_cipher = cipher
             encrypted = cipher.encode(response)
             logger.debug(
                 "Encrypted response: plaintext=%d bytes, encrypted=%d bytes",
@@ -270,6 +277,45 @@ class QueryMasterServer(asyncio.Protocol):
     # Shared handler instance with room/game data
     _handler: QueryMasterHandler | None = None
 
+    # Connections that asked for pushed list updates (SDK option PUSH_UPDATES) and are still open
+    _subscribers: "set[QueryMasterServer]" = set()
+    PUSH_UPDATES_OPTION = 4
+    # Games whose clients keep the list connection open and expect later changes; RA3 and CnC3 re-query instead
+    PUSH_GAMES = ("ccgenerals", "ccgenzh")
+
+    @classmethod
+    def on_game_event(cls, event: str, game: GameEntry):
+        """Registry listener: tell every subscribed list connection about a new, changed or removed game."""
+        for subscriber in list(cls._subscribers):
+            subscriber.push_game(event, game)
+
+    def _maybe_subscribe(self, handler: "QueryMasterHandler"):
+        request = handler.last_request
+        if request is None or handler.last_cipher is None or is_room_list_request(request):
+            return
+        if request.game_name.lower() not in self.PUSH_GAMES or len(request.tail) < 4:
+            return
+        if not (struct.unpack("!I", request.tail[:4])[0] & self.PUSH_UPDATES_OPTION):
+            return
+        self.cipher = handler.last_cipher
+        self.push_fields = request.fields
+        self.push_conditions = parse_filter_string(request.filter_string)
+        QueryMasterServer._subscribers.add(self)
+        logger.info("Master server: %s subscribed to list updates (%s)", self.peername, request.filter_string)
+
+    def push_game(self, event: str, game: GameEntry):
+        if self.transport is None or self.cipher is None:
+            return
+        handler = self.get_handler()
+        if not handler._game_matches_filters(game, self.push_conditions):
+            return
+        if event == "delete":
+            message = build_delete_server_message(game)
+        else:
+            message = build_push_server_message(game, self.push_fields)
+        self.transport.write(self.cipher.encrypt(message))
+        logger.debug("Master server: pushed %s to %s", event, self.peername)
+
     @classmethod
     def set_handler(cls, handler: QueryMasterHandler):
         """Set the shared handler instance."""
@@ -288,6 +334,9 @@ class QueryMasterServer(asyncio.Protocol):
         self.transport = None
         self.peername = None
         self.buffer = b""
+        self.cipher = None
+        self.push_fields: list = []
+        self.push_conditions: list = []
 
     def connection_made(self, transport):
         self.transport = transport
@@ -347,6 +396,7 @@ class QueryMasterServer(asyncio.Protocol):
                 logger.debug("Sending response: %d bytes", len(response))
                 logger.debug("TX hex (first 100): %s", format_hex(response[:100]))
                 self.transport.write(response)
+                self._maybe_subscribe(handler)
             else:
                 logger.warning("No response generated for query")
 
@@ -358,6 +408,7 @@ class QueryMasterServer(asyncio.Protocol):
     def connection_lost(self, exc):
         logger.debug("Master server: connection closed for %s", self.peername)
         self.buffer = b""
+        QueryMasterServer._subscribers.discard(self)
 
 
 # =============================================================================
@@ -392,6 +443,7 @@ async def start_master_server(
     handler.set_rooms(create_default_rooms())
     handler.set_rooms_by_game(create_rooms_by_game())
     QueryMasterServer.set_handler(handler)
+    GameSessionRegistry.add_listener(QueryMasterServer.on_game_event)
 
     logger.info("Master server using gamekeys for %d games", len(handler.gamekeys))
 
